@@ -1,0 +1,16 @@
+{
+  // Configuration Cloudflare — le bouton « Deploy to Cloudflare » crée automatiquement
+  // la base D1 et l'espace KV, puis remplace les identifiants ci-dessous.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "golsh-depot",
+  "main": "src/worker.js",
+  "compatibility_date": "2025-10-01",
+  "assets": { "directory": "./public", "binding": "ASSETS" },
+  "d1_databases": [
+    { "binding": "DB", "database_name": "golsh-depot-db", "database_id": "00000000-0000-0000-0000-000000000000" }
+  ],
+  "kv_namespaces": [
+    { "binding": "PHOTOS", "id": "00000000000000000000000000000000" }
+  ],
+  "observability": { "enabled": true }
+}

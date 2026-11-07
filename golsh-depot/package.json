@@ -1,0 +1,21 @@
+{
+  "name": "golsh-depot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Dépôt-vente multi-fournisseurs : stock, caisse, étiquettes QR, marges et reversements (Cloudflare Workers + D1)",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "test": "node --test --no-warnings test/api.test.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  },
+  "cloudflare": {
+    "bindings": {
+      "DB": { "description": "Base de données du dépôt-vente (créée automatiquement)" },
+      "PHOTOS": { "description": "Stockage des photos des articles (créé automatiquement)" }
+    }
+  }
+}
