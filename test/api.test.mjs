@@ -37,7 +37,7 @@ test('parcours complet dépôt-vente', async () => {
 
   r = await call('GET', '/api/status');
   assert.equal(r.data.initialized, true);
-  assert.equal(r.data.user.role, 'admin');
+  assert.equal(r.data.user.role, 'superadmin');
 
   // CSRF
   const noHdr = await worker.fetch(new Request('https://test.local/api/logout', { method: 'POST', headers: { cookie } }), env);

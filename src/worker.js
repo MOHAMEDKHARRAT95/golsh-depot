@@ -3,7 +3,7 @@
 //  Aucune dépendance externe. Le schéma de base se crée tout seul.
 // =====================================================================
 
-const SCHEMA_VERSION = '1';
+const SCHEMA_VERSION = '2';
 const SESSION_DAYS = 30;
 const PBKDF2_ITER = 10000;
 const SELLABLE = "('en_vente','reserve')";
@@ -28,6 +28,8 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS payouts (id TEXT PRIMARY KEY, number TEXT, supplier_id INTEGER NOT NULL, amount REAL NOT NULL, method TEXT, reference TEXT, notes TEXT, user_id INTEGER, created_at TEXT NOT NULL)`,
   `CREATE TABLE IF NOT EXISTS movements (id INTEGER PRIMARY KEY AUTOINCREMENT, item_id INTEGER, type TEXT NOT NULL, note TEXT, user_id INTEGER, created_at TEXT NOT NULL)`,
   `CREATE INDEX IF NOT EXISTS idx_mov_item ON movements(item_id)`,
+  `CREATE TABLE IF NOT EXISTS audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, user_name TEXT, action TEXT NOT NULL, detail TEXT, created_at TEXT NOT NULL)`,
+  `CREATE INDEX IF NOT EXISTS idx_audit_date ON audit_log(created_at)`,
   `CREATE TABLE IF NOT EXISTS inventories (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, created_at TEXT NOT NULL, scanned INTEGER, found INTEGER, missing INTEGER, unexpected INTEGER, data TEXT)`,
 ];
 
@@ -56,6 +58,29 @@ const DEFAULT_SETTINGS = {
 };
 
 let schemaReady = false;
+
+const MIGRATIONS = {
+  // v2 : super admin + journal d'activité. Le premier administrateur créé devient super admin.
+  2: [
+    `CREATE TABLE IF NOT EXISTS audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, user_name TEXT, action TEXT NOT NULL, detail TEXT, created_at TEXT NOT NULL)`,
+    `CREATE INDEX IF NOT EXISTS idx_audit_date ON audit_log(created_at)`,
+    `UPDATE users SET role = 'superadmin' WHERE id = (SELECT MIN(id) FROM users WHERE role = 'admin') AND NOT EXISTS (SELECT 1 FROM users WHERE role = 'superadmin')`,
+  ],
+};
+
+const ROLES = ['caissier', 'admin', 'superadmin'];
+const ROLE_LABEL = { caissier: 'Caissier', admin: 'Administrateur', superadmin: 'Super admin' };
+const isAdminRole = (r) => r === 'admin' || r === 'superadmin';
+
+async function audit(env, user, action, detail) {
+  try {
+    await env.DB.prepare(`INSERT INTO audit_log (user_id, user_name, action, detail, created_at) VALUES (?, ?, ?, ?, ?)`)
+      .bind(user?.id ?? null, user ? user.name || user.username : null, action, detail ? String(detail).slice(0, 500) : null, nowIso())
+      .run();
+  } catch (e) {
+    console.error('audit', e);
+  }
+}
 
 // ---------------------------------------------------------------- utils
 const nowIso = () => new Date().toISOString();
@@ -152,6 +177,15 @@ async function ensureSchema(env) {
     await env.DB.prepare(`INSERT OR IGNORE INTO settings (key, value) VALUES ${entries.map(() => '(?, ?)').join(',')}`)
       .bind(...entries.flat())
       .run();
+  } else {
+    // mises à jour automatiques des installations existantes
+    const row = await env.DB.prepare(`SELECT value FROM settings WHERE key='schema_version'`).first();
+    let v = Number(row?.value || 1);
+    while (v < Number(SCHEMA_VERSION)) {
+      v++;
+      const steps = MIGRATIONS[v] || [];
+      await env.DB.batch([...steps.map((q) => env.DB.prepare(q)), env.DB.prepare(`UPDATE settings SET value = ? WHERE key = 'schema_version'`).bind(String(v))]);
+    }
   }
   schemaReady = true;
 }
@@ -284,8 +318,12 @@ async function createSession(env, userId) {
   return token;
 }
 
+function requireSuper(user) {
+  if (!user || user.role !== 'superadmin') throw new HttpError(403, 'Réservé au super admin');
+}
+
 function requireAdmin(user) {
-  if (!user || user.role !== 'admin') throw new HttpError(403, 'Réservé à l’administrateur');
+  if (!user || !isAdminRole(user.role)) throw new HttpError(403, 'Réservé à l’administrateur');
 }
 
 function validPassword(p) {
@@ -307,7 +345,7 @@ const route = (method, pattern, handler, opts = {}) => {
 route('GET', '/api/status', async (req, env, ctx) => {
   const row = await env.DB.prepare(`SELECT COUNT(*) AS n FROM users`).first();
   const s = await getSettings(env);
-  return json({ initialized: row.n > 0, user: ctx.user, shop_name: s.shop_name, color: s.color, photos: !!env.PHOTOS });
+  return json({ initialized: row.n > 0, user: ctx.user, shop_name: s.shop_name, color: s.color, photos: !!env.PHOTOS, ai: !!env.AI });
 }, { public: true });
 
 route('POST', '/api/setup', async (req, env) => {
@@ -319,7 +357,7 @@ route('POST', '/api/setup', async (req, env) => {
   const pw = validPassword(body.password);
   const salt = newSalt();
   const stmts = [
-    env.DB.prepare(`INSERT INTO users (username, name, role, pass_hash, salt, created_at) VALUES (?, ?, 'admin', ?, ?, ?)`).bind(
+    env.DB.prepare(`INSERT INTO users (username, name, role, pass_hash, salt, created_at) VALUES (?, ?, 'superadmin', ?, ?, ?)`).bind(
       username, str(body.name, 80) || username, await hashPassword(pw, salt), salt, nowIso()
     ),
   ];
@@ -349,6 +387,7 @@ route('POST', '/api/login', async (req, env) => {
     throw new HttpError(401, 'Identifiant ou mot de passe incorrect');
   }
   const token = await createSession(env, u.id);
+  await audit(env, u, 'Connexion', null);
   return json({ ok: true }, 200, { 'set-cookie': sessionCookie(token, SESSION_DAYS * 86400) });
 }, { public: true });
 
@@ -407,6 +446,7 @@ route('PUT', '/api/settings', async (req, env, ctx) => {
     stmts.push(env.DB.prepare(`INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).bind(k, v));
   }
   if (stmts.length) await env.DB.batch(stmts);
+  await audit(env, ctx.user, 'Réglages modifiés', Object.keys(body).filter((k) => EDITABLE_SETTINGS.includes(k)).join(', '));
   return json({ ok: true });
 });
 
@@ -422,7 +462,8 @@ route('POST', '/api/users', async (req, env, ctx) => {
   const b = await req.json();
   const username = str(b.username, 40)?.toLowerCase();
   if (!username || !/^[a-z0-9._-]+$/.test(username)) throw new HttpError(400, 'Identifiant invalide (lettres, chiffres, . _ -)');
-  const role = b.role === 'admin' ? 'admin' : 'caissier';
+  const role = ROLES.includes(b.role) ? b.role : 'caissier';
+  if (role !== 'caissier' && ctx.user.role !== 'superadmin') throw new HttpError(403, 'Seul le super admin peut créer un administrateur');
   const salt = newSalt();
   try {
     await env.DB.prepare(`INSERT INTO users (username, name, role, pass_hash, salt, created_at) VALUES (?, ?, ?, ?, ?, ?)`)
@@ -431,6 +472,7 @@ route('POST', '/api/users', async (req, env, ctx) => {
   } catch (e) {
     throw new HttpError(409, 'Cet identifiant existe déjà');
   }
+  await audit(env, ctx.user, 'Utilisateur créé', `${username} (${ROLE_LABEL[role]})`);
   return json({ ok: true });
 });
 
@@ -438,10 +480,16 @@ route('PUT', '/api/users/:id', async (req, env, ctx, p) => {
   requireAdmin(ctx.user);
   const id = int(p.id);
   const b = await req.json();
-  if (id === ctx.user.id && (b.active === false || b.role === 'caissier')) throw new HttpError(400, 'Vous ne pouvez pas désactiver ou rétrograder votre propre compte');
+  const target = await env.DB.prepare(`SELECT id, username, role FROM users WHERE id = ?`).bind(id).first();
+  if (!target) throw new HttpError(404, 'Utilisateur introuvable');
+  const isSuper = ctx.user.role === 'superadmin';
+  if (!isSuper && target.role !== 'caissier') throw new HttpError(403, 'Seul le super admin peut modifier un administrateur');
+  if (b.role !== undefined && !ROLES.includes(b.role)) throw new HttpError(400, 'Rôle invalide');
+  if (!isSuper && b.role !== undefined && b.role !== 'caissier') throw new HttpError(403, 'Seul le super admin peut nommer un administrateur');
+  if (id === ctx.user.id && (b.active === false || (b.role !== undefined && b.role !== ctx.user.role))) throw new HttpError(400, 'Vous ne pouvez pas désactiver ou changer le rôle de votre propre compte');
   const stmts = [];
   if (b.name !== undefined) stmts.push(env.DB.prepare(`UPDATE users SET name = ? WHERE id = ?`).bind(str(b.name, 80), id));
-  if (b.role !== undefined) stmts.push(env.DB.prepare(`UPDATE users SET role = ? WHERE id = ?`).bind(b.role === 'admin' ? 'admin' : 'caissier', id));
+  if (b.role !== undefined) stmts.push(env.DB.prepare(`UPDATE users SET role = ? WHERE id = ?`).bind(b.role, id));
   if (b.active !== undefined) {
     stmts.push(env.DB.prepare(`UPDATE users SET active = ? WHERE id = ?`).bind(b.active ? 1 : 0, id));
     if (!b.active) stmts.push(env.DB.prepare(`DELETE FROM sessions WHERE user_id = ?`).bind(id));
@@ -451,6 +499,8 @@ route('PUT', '/api/users/:id', async (req, env, ctx, p) => {
     stmts.push(env.DB.prepare(`UPDATE users SET pass_hash = ?, salt = ? WHERE id = ?`).bind(await hashPassword(validPassword(b.password), salt), salt, id));
   }
   if (stmts.length) await env.DB.batch(stmts);
+  const what = [b.role !== undefined && `rôle → ${ROLE_LABEL[b.role]}`, b.active !== undefined && (b.active ? 'activé' : 'désactivé'), b.password && 'mot de passe changé', b.name !== undefined && 'nom modifié'].filter(Boolean).join(', ');
+  await audit(env, ctx.user, 'Utilisateur modifié', `${target.username} : ${what}`);
   return json({ ok: true });
 });
 
@@ -558,7 +608,7 @@ route('POST', '/api/suppliers', async (req, env) => {
 route('PUT', '/api/suppliers/:id', async (req, env, ctx, p) => {
   const b = await req.json();
   const f = supplierFields(b);
-  if (ctx.user.role !== 'admin') {
+  if (!isAdminRole(ctx.user.role)) {
     // le caissier ne peut pas modifier le taux négocié
     const cur = await env.DB.prepare(`SELECT rate FROM suppliers WHERE id = ?`).bind(int(p.id)).first();
     f[6] = cur ? cur.rate : null;
@@ -573,6 +623,7 @@ route('DELETE', '/api/suppliers/:id', async (req, env, ctx, p) => {
   const s = await env.DB.prepare(`SELECT ${SUPPLIER_STATS.replace(/s\.id/g, '?')}`).bind(id, id, id, id, id).first();
   if (s.items_stock > 0 || s.balance > 0.0005) throw new HttpError(400, 'Impossible : ce fournisseur a encore des articles en stock ou un solde à reverser');
   await env.DB.prepare(`UPDATE suppliers SET active = 0 WHERE id = ?`).bind(id).run();
+  await audit(env, ctx.user, 'Fournisseur supprimé', '#' + id);
   return json({ ok: true });
 });
 
@@ -640,7 +691,16 @@ route('POST', '/api/deposits', async (req, env, ctx) => {
   }
   stmts.push(env.DB.prepare(`INSERT INTO movements (item_id, type, note, user_id, created_at) SELECT id, 'depot', ?, ?, ? FROM items WHERE deposit_id = ?`).bind('Bon ' + number, ctx.user.id, t, dep.id));
   await env.DB.batch(stmts);
-  return json({ ok: true, id: dep.id, number });
+  const { results: created } = await env.DB.prepare(`SELECT id, code FROM items WHERE deposit_id = ? ORDER BY id`).bind(dep.id).all();
+  // correspondance ligne saisie → articles créés (utile pour attacher les photos)
+  const lineMap = [];
+  let k = 0;
+  lines.forEach((l, idx) => {
+    const qty = Math.min(50, Math.max(1, Math.round(num(l.qty, 1))));
+    for (let j = 0; j < qty; j++) { if (created[k]) lineMap.push({ line: idx, id: created[k].id, code: created[k].code }); k++; }
+  });
+  await audit(env, ctx.user, 'Dépôt enregistré', `${number} · ${clean.length} article(s)`);
+  return json({ ok: true, id: dep.id, number, items: lineMap });
 });
 
 // ---------- articles
@@ -714,7 +774,7 @@ route('PUT', '/api/items/:id', async (req, env, ctx, p) => {
   const price = num(b.price, cur.price);
   if (price <= 0) throw new HttpError(400, 'Prix invalide');
   if (cur.status === 'vendu' && price !== cur.price) throw new HttpError(400, 'Article déjà vendu : prix non modifiable');
-  const isAdmin = ctx.user.role === 'admin';
+  const isAdmin = isAdminRole(ctx.user.role);
   const rate = isAdmin && 'rate_override' in b ? num(b.rate_override, null) : cur.rate_override;
   const noMd = isAdmin && 'no_markdown' in b ? (b.no_markdown ? 1 : 0) : cur.no_markdown;
   await env.DB.prepare(
@@ -749,6 +809,7 @@ route('POST', '/api/items/status', async (req, env, ctx) => {
   ).bind(to, reservedFor, ['retourne', 'perdu'].includes(to) ? t : null).all();
   const changed = res.results.map((r) => r.id);
   await logMoves(env, changed.map((id) => ({ item_id: id, type: to, note: str(b.note, 200) || STATUS_LABEL[to], user_id: ctx.user.id })));
+  if (to === 'perdu' && changed.length) await audit(env, ctx.user, 'Articles déclarés perdus', `${changed.length} article(s)`);
   return json({ ok: true, changed: changed.length, skipped: ids.length - changed.length });
 });
 
@@ -758,6 +819,7 @@ route('DELETE', '/api/items/:id', async (req, env, ctx, p) => {
   const cur = await env.DB.prepare(`SELECT status FROM items WHERE id = ?`).bind(id).first();
   if (!cur) throw new HttpError(404, 'Article introuvable');
   if (cur.status === 'vendu') throw new HttpError(400, 'Un article vendu ne peut pas être supprimé (annulez la vente d’abord)');
+  await audit(env, ctx.user, 'Article supprimé', '#' + id);
   await env.DB.batch([
     env.DB.prepare(`DELETE FROM items WHERE id = ?`).bind(id),
     env.DB.prepare(`DELETE FROM movements WHERE item_id = ?`).bind(id),
@@ -881,7 +943,7 @@ route('GET', '/api/sales', async (req, env, ctx) => {
     `SELECT v.*, u.name AS user_name, (SELECT COUNT(*) FROM sale_lines l WHERE l.sale_id = v.id) AS n FROM sales v LEFT JOIN users u ON u.id = v.user_id
      ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY v.created_at DESC LIMIT 500`
   ).bind(...args).all();
-  if (ctx.user.role !== 'admin') results.forEach((r) => delete r.shop_total);
+  if (!isAdminRole(ctx.user.role)) results.forEach((r) => delete r.shop_total);
   return json(results);
 });
 
@@ -891,7 +953,7 @@ route('GET', '/api/sales/:id', async (req, env, ctx, p) => {
   const { results } = await env.DB.prepare(
     `SELECT l.*, i.code, i.title, i.size, i.brand, s.name AS supplier_name, s.phone AS supplier_phone FROM sale_lines l JOIN items i ON i.id = l.item_id JOIN suppliers s ON s.id = l.supplier_id WHERE l.sale_id = ? ORDER BY l.id`
   ).bind(p.id).all();
-  if (ctx.user.role !== 'admin') {
+  if (!isAdminRole(ctx.user.role)) {
     delete v.shop_total;
     results.forEach((r) => { delete r.shop_amount; delete r.rate; });
   }
@@ -912,6 +974,7 @@ route('POST', '/api/sales/:id/cancel', async (req, env, ctx, p) => {
     env.DB.prepare(`INSERT INTO movements (item_id, type, note, user_id, created_at) SELECT id, 'annulation', ?, ?, ? FROM items WHERE sale_id = ?`).bind('Annulation vente ' + v.number, ctx.user.id, t, p.id),
     env.DB.prepare(`UPDATE items SET status = 'en_vente', sale_id = NULL, sold_at = NULL WHERE sale_id = ?`).bind(p.id),
   ]);
+  await audit(env, ctx.user, 'Vente annulée', `${v.number} · ${v.total} · ${str(b.reason, 200) || ''}`);
   return json({ ok: true });
 });
 
@@ -935,6 +998,7 @@ route('POST', '/api/payouts', async (req, env, ctx) => {
        SELECT ?, ?, ?, ROUND(COALESCE(SUM(supplier_amount),0), 3), ?, ?, ?, ?, ? FROM sale_lines WHERE payout_id = ?`
     ).bind(id, number, supplierId, method, str(b.reference, 80), str(b.notes, 300), ctx.user.id, nowIso(), id),
   ]);
+  await audit(env, ctx.user, 'Reversement', `${number} · fournisseur #${supplierId} · ${r3(bal.amount)}`);
   return json({ ok: true, id, number });
 });
 
@@ -1006,7 +1070,7 @@ route('GET', '/api/dashboard', async (req, env, ctx) => {
     env.DB.prepare(`SELECT COALESCE(c.name, 'Sans catégorie') AS name, COUNT(*) AS n, SUM(l.final_price) AS total FROM sale_lines l JOIN sales v ON v.id = l.sale_id AND v.status='ok' JOIN items i ON i.id = l.item_id LEFT JOIN categories c ON c.id = i.category_id WHERE strftime('%Y-%m', v.created_at, ${off}) = ? GROUP BY c.id ORDER BY total DESC LIMIT 6`).bind(month),
     env.DB.prepare(`SELECT id, number, total, created_at, payment_method FROM sales WHERE status='ok' ORDER BY created_at DESC LIMIT 6`),
   ]);
-  const isAdmin = ctx.user.role === 'admin';
+  const isAdmin = isAdminRole(ctx.user.role);
   const series = [];
   const map = Object.fromEntries(daily.results.map((r) => [r.d, r]));
   for (let k = 6; k >= 0; k--) {
@@ -1041,6 +1105,7 @@ route('GET', '/api/export/:name', async (req, env, ctx, p) => {
   const name = p.name.replace(/\.csv$/, '');
   if (!EXPORTS[name]) throw new HttpError(404, 'Export inconnu');
   const { results } = await env.DB.prepare(EXPORTS[name]).all();
+  await audit(env, ctx.user, 'Export', name);
   return csv(results, `${name}-${new Date().toISOString().slice(0, 10)}.csv`);
 });
 
@@ -1050,9 +1115,145 @@ route('GET', '/api/backup', async (req, env, ctx) => {
   const res = await env.DB.batch(tables.map((t) => env.DB.prepare(`SELECT * FROM ${t}`)));
   const out = { app: 'golsh-depot', version: SCHEMA_VERSION, exported_at: nowIso(), tables: {} };
   tables.forEach((t, i) => (out.tables[t] = res[i].results));
+  await audit(env, ctx.user, 'Sauvegarde téléchargée', null);
   return new Response(JSON.stringify(out), {
     headers: { 'content-type': 'application/json', 'content-disposition': `attachment; filename="sauvegarde-${new Date().toISOString().slice(0, 10)}.json"`, 'cache-control': 'no-store' },
   });
+});
+
+// ---------- super admin
+route('GET', '/api/audit', async (req, env, ctx) => {
+  requireSuper(ctx.user);
+  const { results } = await env.DB.prepare(`SELECT * FROM audit_log ORDER BY id DESC LIMIT 300`).all();
+  return json(results);
+});
+
+// Récupération : si la variable SUPERADMIN_CODE est définie dans Cloudflare,
+// un utilisateur connecté qui la saisit devient super admin.
+route('POST', '/api/superadmin/claim', async (req, env, ctx) => {
+  const secret = env.SUPERADMIN_CODE ? String(env.SUPERADMIN_CODE) : '';
+  if (!secret) throw new HttpError(404, 'Code super admin non configuré dans Cloudflare (variable SUPERADMIN_CODE)');
+  const key = 'claim:' + ctx.user.id;
+  const since = new Date(Date.now() - 15 * 60000).toISOString();
+  const att = await env.DB.prepare(`SELECT COUNT(*) AS n FROM login_attempts WHERE username = ? AND ts > ?`).bind(key, since).first();
+  if (att.n >= 5) throw new HttpError(429, 'Trop de tentatives. Réessayez dans 15 minutes.');
+  const b = await req.json();
+  const given = String(b.code || '');
+  if (!safeEqual(await sha256(given), await sha256(secret))) {
+    await env.DB.prepare(`INSERT INTO login_attempts (username, ts) VALUES (?, ?)`).bind(key, nowIso()).run();
+    throw new HttpError(403, 'Code incorrect');
+  }
+  await env.DB.prepare(`UPDATE users SET role = 'superadmin' WHERE id = ?`).bind(ctx.user.id).run();
+  await audit(env, ctx.user, 'Super admin activé (code)', ctx.user.username);
+  return json({ ok: true });
+});
+
+// Remise à zéro des données de test (garde les utilisateurs, réglages et catégories)
+route('POST', '/api/superadmin/reset', async (req, env, ctx) => {
+  requireSuper(ctx.user);
+  const b = await req.json();
+  if (b.confirm !== 'SUPPRIMER') throw new HttpError(400, 'Tapez SUPPRIMER pour confirmer');
+  await env.DB.batch([
+    ...['sale_lines', 'sales', 'payouts', 'movements', 'inventories', 'items', 'deposits', 'suppliers'].map((t) => env.DB.prepare(`DELETE FROM ${t}`)),
+    env.DB.prepare(`UPDATE settings SET value = '0' WHERE key IN ('seq_item','seq_sale','seq_deposit','seq_payout','seq_supplier')`),
+  ]);
+  await audit(env, ctx.user, 'REMISE À ZÉRO des données', 'articles, ventes, fournisseurs, dépôts, reversements');
+  return json({ ok: true });
+});
+
+// ---------- analyse de photo par IA (Cloudflare Workers AI, offre gratuite)
+const AI_MODELS = ['@cf/google/gemma-4-26b-a4b-it', '@cf/meta/llama-4-scout-17b-16e-instruct', '@cf/meta/llama-3.2-11b-vision-instruct'];
+const CONDITIONS = ['Neuf avec étiquette', 'Neuf sans étiquette', 'Très bon état', 'Bon état', 'État correct'];
+
+function b64big(buf) {
+  const bytes = new Uint8Array(buf);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+const fold = (t) => String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().trim();
+
+function aiText(out) {
+  if (!out) return '';
+  if (typeof out === 'string') return out;
+  if (out.response !== undefined) return typeof out.response === 'string' ? out.response : JSON.stringify(out.response);
+  const c = out.choices?.[0]?.message?.content;
+  if (typeof c === 'string') return c;
+  if (Array.isArray(c)) return c.map((x) => x.text || '').join('');
+  return JSON.stringify(out);
+}
+function aiJson(text) {
+  const t = String(text).replace(/```(?:json)?/gi, '');
+  const a = t.indexOf('{'), z = t.lastIndexOf('}');
+  if (a < 0 || z <= a) return null;
+  try { return JSON.parse(t.slice(a, z + 1)); } catch { return null; }
+}
+
+function aiNormalize(d, cats) {
+  const pick = (...k) => { for (const x of k) if (d[x] !== undefined && d[x] !== null && String(d[x]).trim() && !/^(null|inconnu|unknown|n\/a|aucune?)$/i.test(String(d[x]).trim())) return String(d[x]).trim(); return null; };
+  const catName = fold(pick('categorie', 'catégorie', 'category'));
+  let cat = cats.find((c) => fold(c.name) === catName) || (catName ? cats.find((c) => catName.includes(fold(c.name)) || fold(c.name).includes(catName)) : null);
+  const etat = fold(pick('etat', 'état', 'condition'));
+  const condition = CONDITIONS.find((c) => fold(c) === etat) || (etat ? CONDITIONS.find((c) => etat.includes(fold(c).split(' ')[0])) : null) || null;
+  let price = num(pick('prix', 'price', 'prix_conseille'), null);
+  if (price !== null) price = price > 2 ? Math.round(price) : r3(price);
+  const desc = [pick('description'), pick('matiere', 'matière') && 'Matière : ' + pick('matiere', 'matière')].filter(Boolean).join(' — ');
+  return {
+    title: pick('titre', 'title', 'designation', 'désignation')?.slice(0, 80) || null,
+    category_id: cat ? cat.id : null,
+    category_name: cat ? cat.name : null,
+    brand: pick('marque', 'brand')?.slice(0, 60) || null,
+    size: pick('taille', 'size')?.slice(0, 30) || null,
+    color: pick('couleur', 'color')?.slice(0, 30) || null,
+    condition,
+    price: price && price > 0 ? price : null,
+    description: desc ? desc.slice(0, 300) : null,
+  };
+}
+
+route('POST', '/api/ai/analyze', async (req, env) => {
+  if (!env.AI) throw new HttpError(501, 'Analyse photo non activée (ajoutez "ai" dans wrangler.jsonc)');
+  const buf = await req.arrayBuffer();
+  if (!buf.byteLength || buf.byteLength > 1_500_000) throw new HttpError(400, 'Photo trop lourde (max 1,5 Mo)');
+  const type = (req.headers.get('content-type') || 'image/jpeg').split(';')[0];
+  const dataUrl = `data:${type};base64,${b64big(buf)}`;
+  const { results: cats } = await env.DB.prepare(`SELECT id, name FROM categories ORDER BY name`).all();
+  const settings = await getSettings(env);
+  const prompt = `Tu aides une boutique de dépôt-vente (vêtements, chaussures, sacs, accessoires, objets) en Tunisie à enregistrer un article d'occasion à partir de cette photo.
+Réponds UNIQUEMENT avec un objet JSON valide, sans aucun texte autour, avec ces clés :
+{"titre": "désignation courte et vendeuse en français, 3 à 6 mots, ex : Robe longue fleurie",
+ "categorie": "une valeur EXACTE parmi : ${cats.map((c) => c.name).join(' | ')}",
+ "marque": "marque lisible sur l'étiquette ou le logo, sinon null — n'invente jamais",
+ "taille": "taille lisible sur l'étiquette (S, M, 38, 8 ans…), sinon null",
+ "couleur": "couleur principale en français",
+ "etat": "une valeur EXACTE parmi : ${CONDITIONS.join(' | ')}",
+ "matiere": "matière si lisible sur l'étiquette, sinon null",
+ "prix": nombre : prix de revente d'occasion conseillé en ${settings.currency || 'DT'} (dinars tunisiens) pour le marché tunisien,
+ "description": "une phrase courte décrivant l'article"}`;
+  const errors = [];
+  for (const model of AI_MODELS) {
+    const input = {
+      messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: dataUrl } }, { type: 'text', text: prompt }] }],
+      temperature: 0.2,
+      ...(model.includes('gemma') ? { max_completion_tokens: 1500 } : { max_tokens: 600 }),
+    };
+    try {
+      let out;
+      try {
+        out = await env.AI.run(model, input);
+      } catch (e) {
+        // certains modèles Meta demandent une acceptation de licence au premier usage
+        if (/agree/i.test(e.message || '')) { await env.AI.run(model, { prompt: 'agree' }); out = await env.AI.run(model, input); }
+        else throw e;
+      }
+      const data = aiJson(aiText(out));
+      if (data) return json({ ok: true, model, fields: aiNormalize(data, cats) });
+      errors.push(model.split('/').pop() + ' : réponse illisible');
+    } catch (e) {
+      errors.push(model.split('/').pop() + ' : ' + (e.message || e));
+    }
+  }
+  throw new HttpError(502, 'Analyse impossible pour le moment. Remplissez la fiche à la main.', { details: errors });
 });
 
 // ---------------------------------------------------------------- entrée
@@ -1094,4 +1295,4 @@ export default {
 };
 
 // exporté pour les tests
-export const _internals = { currentPrice, resolveRate, extractCode };
+export const _internals = { currentPrice, resolveRate, extractCode, aiNormalize, aiJson, aiText };

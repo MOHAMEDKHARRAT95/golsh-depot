@@ -1,6 +1,6 @@
 // Service worker : l'application s'ouvre instantanément et reste affichable sans réseau.
-const VERSION = 'golsh-v2';
-const SHELL = ['/', '/index.html', '/style.css?v=2', '/app.js?v=2', '/vendor/qrcode.js?v=2', '/manifest.webmanifest', '/icons/icon-192.png', '/icons/apple-touch-icon.png'];
+const VERSION = 'golsh-v3';
+const SHELL = ['/', '/index.html', '/style.css?v=3', '/app.js?v=3', '/vendor/qrcode.js?v=3', '/manifest.webmanifest', '/icons/icon-192.png', '/icons/apple-touch-icon.png'];
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(VERSION).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));

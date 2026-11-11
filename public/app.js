@@ -36,7 +36,10 @@ function localDay(offsetDays = 0) {
   const d = new Date(Date.now() + offsetDays * 86400000);
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
-const isAdmin = () => S.user?.role === 'admin';
+const isAdmin = () => S.user?.role === 'admin' || S.user?.role === 'superadmin';
+const isSuper = () => S.user?.role === 'superadmin';
+const ROLE_LABEL = { caissier: 'Caissier', admin: 'Administrateur', superadmin: 'Super admin' };
+const roleLabel = () => ROLE_LABEL[S.user?.role] || '';
 const normCode = (raw) => {
   let s = String(raw || '').trim();
   const m = s.match(/#\/a\/([A-Za-z0-9-]+)/);
@@ -363,6 +366,7 @@ const SIDE = [
   { h: 'reversements', ic: '⇄', t: 'Reversements', admin: true },
   { h: 'inventaire', ic: '✓', t: 'Inventaire' },
   { sep: true },
+  { h: 'journal', ic: '☷', t: 'Journal d’activité', sup: true },
   { h: 'reglages', ic: '⚙', t: 'Réglages' },
 ];
 function renderShell() {
@@ -371,8 +375,8 @@ function renderShell() {
     <header class="topbar"><div class="logo"><span class="wordmark">${esc(S.status?.shop_name || 'Golsh')}</span><small>Dépôt</small></div>
       <button id="tb-scan" aria-label="Scanner un article">⌗ Scanner</button></header>
     <div class="offline hidden" id="offline">Hors connexion — les données affichées peuvent ne pas être à jour</div>
-    <nav class="side">${SIDE.filter((n) => !n.admin || isAdmin()).map((n) => (n.sep ? '<div class="sep"></div>' : `<a href="#/${n.h}" data-h="${n.h}"><span>${n.ic}</span>${n.t}</a>`)).join('')}
-      <div class="sep"></div><div class="small muted" style="padding:4px 12px">${esc(S.user.name || S.user.username)} · ${isAdmin() ? 'Administrateur' : 'Caissier'}</div></nav>
+    <nav class="side">${SIDE.filter((n) => (!n.admin || isAdmin()) && (!n.sup || isSuper())).map((n) => (n.sep ? '<div class="sep"></div>' : `<a href="#/${n.h}" data-h="${n.h}"><span>${n.ic}</span>${n.t}</a>`)).join('')}
+      <div class="sep"></div><div class="small muted" style="padding:4px 12px">${esc(S.user.name || S.user.username)} · ${roleLabel()}</div></nav>
     <main id="main"></main>
     <nav class="tabs">${NAV.map((n) => `<a href="#/${n.h}" data-h="${n.h}" class="${n.cta ? 'cta' : ''}"><span class="ic">${n.ic}</span>${n.t}</a>`).join('')}</nav>`;
   $('#tb-scan').onclick = () => openScanner({ title: 'Trouver un article', onCode: (c) => { location.hash = '#/a/' + c; } });
@@ -397,6 +401,7 @@ const ROUTES = [
   [/^reversement\/([\w-]+)$/, viewPayout, 'plus'],
   [/^inventaire$/, viewInventory, 'plus'],
   [/^reglages$/, viewSettings, 'plus'],
+  [/^journal$/, viewJournal, 'plus'],
   [/^plus$/, viewMore],
 ];
 
@@ -776,10 +781,26 @@ function editItem(it) {
 }
 
 // ------------------------------------------------------------------ DÉPÔT (nouveau)
+// photos des articles en cours de dépôt (gardées en mémoire + sauvegardées si possible)
+const DPHOTO = {
+  mem: new Map(),
+  get(k) { if (!k) return null; if (this.mem.has(k)) return this.mem.get(k); const v = store.get('ph_' + k, null); if (v) this.mem.set(k, v); return v; },
+  set(k, v) { this.mem.set(k, v); try { localStorage.setItem('gs_ph_' + k, JSON.stringify(v)); } catch { /* mémoire pleine : gardée pour la session */ } },
+  del(k) { this.mem.delete(k); try { localStorage.removeItem('gs_ph_' + k); } catch { /* ignore */ } },
+};
+const blobToDataUrl = (b) => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(b); });
+
 async function viewDepotNew(main) {
   await ensureCats();
   const draft = store.get('depot', { supplier: null, items: [], notes: '' });
   const save = () => store.set('depot', draft);
+  let pending = null; // photo du formulaire en cours : { key, url }
+  const photoZone = () => `
+    <div style="margin-bottom:12px">
+      ${pending ? `<div class="row" style="align-items:flex-start"><img src="${pending.url}" class="ph-prev" alt=""><div class="grow small" id="d-ai-msg">${pending.msg || ''}</div><button type="button" class="icon-btn" id="d-ph-x" title="Retirer la photo">✕</button></div>` : ''}
+      <label class="btn ${pending ? '' : 'primary'} block ${pending ? '' : 'big'}" style="margin-top:${pending ? '8px' : '0'}">📷 ${pending ? 'Reprendre la photo' : 'Photographier l’article' + (S.status.ai ? ' — remplissage auto ✨' : '')}<input type="file" accept="image/*" capture="environment" id="d-photo" hidden></label>
+      ${!pending && S.status.ai ? '<div class="small muted" style="text-align:center;margin-top:6px">Prenez l’article à plat ou l’étiquette bien visible : l’IA propose la désignation, la catégorie, la marque, la taille, la couleur, l’état et un prix.</div>' : ''}
+    </div>`;
   const draw = () => {
     main.innerHTML = `
       <div class="page-head"><h1>Nouveau dépôt</h1><a class="btn sm" href="#/depots">Bons de dépôt</a></div>
@@ -788,9 +809,9 @@ async function viewDepotNew(main) {
         : `<div class="row" style="margin-top:8px"><div class="search grow"><input id="d-sq" placeholder="Nom ou téléphone…" autocomplete="off"></div><button class="btn primary" id="d-new">＋ Nouveau</button></div><div class="list" id="d-sl"></div>`}
       </div>
       ${draft.supplier ? `
-      <div class="card"><h3>2. Ajouter un article</h3><form id="d-add">${itemFormFields()}<button class="btn gold block big">＋ Ajouter à la liste</button></form></div>
+      <div class="card"><h3>2. Ajouter un article</h3><div id="d-pz">${photoZone()}</div><form id="d-add">${itemFormFields()}<button class="btn gold block big">＋ Ajouter à la liste</button></form></div>
       <div class="card"><div class="between"><h3 style="margin:0">3. Articles déposés (${draft.items.reduce((a, i) => a + (Number(i.qty) || 1), 0)})</h3><span class="price">${money(draft.items.reduce((a, i) => a + Number(String(i.price).replace(',', '.')) * (Number(i.qty) || 1), 0))}</span></div>
-        <div class="list">${draft.items.map((i, k) => `<div class="it"><div class="grow"><div class="t">${esc(i.title)}${Number(i.qty) > 1 ? ` <span class="badge b-reserve">×${esc(i.qty)}</span>` : ''}</div><div class="s">${[S.cats.find((c) => String(c.id) === String(i.category_id))?.name, i.brand, i.size && 'T. ' + i.size, i.condition].filter(Boolean).map(esc).join(' · ')}</div></div><span class="price">${money(String(i.price).replace(',', '.'))}</span><button class="icon-btn" data-dup="${k}" title="Dupliquer">⧉</button><button class="icon-btn" data-rm="${k}" title="Retirer">✕</button></div>`).join('') || empty('Aucun article pour l’instant')}</div>
+        <div class="list">${draft.items.map((i, k) => `<div class="it">${DPHOTO.get(i.photo_key) ? `<div class="thumb"><img src="${DPHOTO.get(i.photo_key)}" alt=""></div>` : `<div class="thumb">${esc((i.title || '?')[0])}</div>`}<div class="grow"><div class="t">${esc(i.title)}${Number(i.qty) > 1 ? ` <span class="badge b-reserve">×${esc(i.qty)}</span>` : ''}</div><div class="s">${[S.cats.find((c) => String(c.id) === String(i.category_id))?.name, i.brand, i.size && 'T. ' + i.size, i.condition].filter(Boolean).map(esc).join(' · ')}</div></div><span class="price">${money(String(i.price).replace(',', '.'))}</span><button class="icon-btn" data-dup="${k}" title="Dupliquer">⧉</button><button class="icon-btn" data-rm="${k}" title="Retirer">✕</button></div>`).join('') || empty('Aucun article pour l’instant')}</div>
         <label class="f" style="margin-top:10px"><span>Remarques sur le dépôt</span><input id="d-notes" value="${esc(draft.notes)}"></label>
         <button class="btn primary block big" id="d-save" ${draft.items.length ? '' : 'disabled'}>✓ Enregistrer le dépôt et créer les étiquettes</button>
         ${draft.items.length ? '<button class="btn block danger" id="d-reset" style="margin-top:8px">Annuler ce brouillon</button>' : ''}
@@ -807,11 +828,62 @@ async function viewDepotNew(main) {
       return;
     }
     $('#d-chg').onclick = () => { draft.supplier = null; save(); draw(); };
+    const bindPhoto = () => {
+      $('#d-pz').innerHTML = photoZone();
+      $('#d-ph-x')?.addEventListener('click', () => { if (pending) DPHOTO.del(pending.key); pending = null; bindPhoto(); });
+      $('#d-photo').onchange = async (e) => {
+        const f = e.target.files[0]; if (!f) return;
+        try {
+          const blob = await compressImage(f, 1000, 0.75);
+          const url = await blobToDataUrl(blob);
+          const key = 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+          if (pending) DPHOTO.del(pending.key);
+          DPHOTO.set(key, url);
+          pending = { key, url, msg: S.status.ai ? '<span class="muted">✨ Analyse de la photo…</span>' : '<span class="muted">Photo ajoutée à l’article.</span>' };
+          bindPhoto();
+          if (S.status.ai) await analyse(blob);
+        } catch (er) { fail(er); }
+      };
+    };
+    const analyse = async (blob) => {
+      const form = $('#d-add');
+      try {
+        const r = await api('POST', '/api/ai/analyze', blob);
+        const f = r.fields || {};
+        const filled = [];
+        const setv = (name, v, label) => {
+          const el = form.elements[name];
+          if (!el || v === null || v === undefined || v === '') return;
+          if (el.value && el.value !== '1' && name !== 'qty') return; // ne remplace pas ce qui a été saisi
+          if (el.tagName === 'SELECT' && ![...el.options].some((o) => o.value === String(v))) return;
+          el.value = v; el.classList.add('ai-filled'); filled.push(label);
+        };
+        setv('title', f.title, 'désignation');
+        setv('category_id', f.category_id, 'catégorie');
+        setv('brand', f.brand, 'marque');
+        setv('size', f.size, 'taille');
+        setv('color', f.color, 'couleur');
+        setv('condition', f.condition, 'état');
+        setv('price', f.price, 'prix');
+        setv('description', f.description, 'notes');
+        if (pending) pending.msg = filled.length
+          ? `<b>✨ Fiche pré-remplie</b> (${filled.join(', ')}).<br><span class="muted">Vérifiez les champs surlignés${f.price ? ', surtout le prix qui est une suggestion' : ''}.</span>`
+          : '<span class="muted">L’IA n’a rien pu lire de fiable : complétez à la main.</span>';
+      } catch (er) {
+        if (pending) pending.msg = `<span class="muted">Analyse indisponible (${esc(er.message)}). Complétez à la main, la photo sera quand même enregistrée.</span>`;
+      }
+      const m = $('#d-ai-msg'); if (m && pending) m.innerHTML = pending.msg;
+      form.elements.title?.focus({ preventScroll: true });
+    };
+    bindPhoto();
+    $('#d-add').addEventListener('input', (e) => e.target.classList.remove('ai-filled'));
     $('#d-add').onsubmit = (e) => {
       e.preventDefault();
       const d = formData(e.target);
       const p = Number(String(d.price).replace(',', '.'));
       if (!d.title.trim() || !(p > 0)) return toast('Désignation et prix obligatoires', 'bad');
+      if (pending) d.photo_key = pending.key;
+      pending = null;
       draft.items.push(d); save(); draw();
       toast('Ajouté ✓');
       const t = $('#d-add input[name=title]'); if (t && !isTouch) t.focus();
@@ -819,9 +891,18 @@ async function viewDepotNew(main) {
     $$('[data-rm]').forEach((b) => (b.onclick = () => { draft.items.splice(+b.dataset.rm, 1); save(); draw(); }));
     $$('[data-dup]').forEach((b) => (b.onclick = () => { draft.items.splice(+b.dataset.dup + 1, 0, { ...draft.items[+b.dataset.dup] }); save(); draw(); }));
     $('#d-notes').onchange = (e) => { draft.notes = e.target.value; save(); };
-    $('#d-reset')?.addEventListener('click', async () => { if (await confirmDlg('Effacer le brouillon ?', { danger: true, ok: 'Effacer' })) { draft.items = []; draft.notes = ''; save(); draw(); } });
+    $('#d-reset')?.addEventListener('click', async () => { if (await confirmDlg('Effacer le brouillon ?', { danger: true, ok: 'Effacer' })) { draft.items.forEach((i) => DPHOTO.del(i.photo_key)); draft.items = []; draft.notes = ''; save(); draw(); } });
     $('#d-save').onclick = (e) => busy(e.currentTarget, async () => {
-      const r = await POST('/api/deposits', { supplier_id: draft.supplier.id, notes: draft.notes, items: draft.items });
+      const r = await POST('/api/deposits', { supplier_id: draft.supplier.id, notes: draft.notes, items: draft.items.map(({ photo_key, ...x }) => x) });
+      // envoi des photos sur les articles créés
+      const jobs = (r.items || []).map((x) => ({ id: x.id, key: draft.items[x.line]?.photo_key })).filter((j) => j.key && DPHOTO.get(j.key));
+      let okN = 0;
+      for (const [i, j] of jobs.entries()) {
+        toast(`Envoi des photos ${i + 1}/${jobs.length}…`);
+        try { const blob = await (await fetch(DPHOTO.get(j.key))).blob(); await api('PUT', `/api/items/${j.id}/photo`, blob); okN++; } catch { /* on continue */ }
+      }
+      if (jobs.length && okN < jobs.length) toast(`${jobs.length - okN} photo(s) non envoyée(s) — ajoutez-les depuis la fiche article`, 'bad');
+      draft.items.forEach((i) => DPHOTO.del(i.photo_key));
       store.set('depot', { supplier: null, items: [], notes: '' });
       toast(`Dépôt ${r.number} enregistré`, 'ok');
       location.hash = `#/depot/${r.id}?new=1`;
@@ -1138,8 +1219,13 @@ async function viewSettings(main) {
       <form class="row" id="st-cat" style="margin-top:8px"><input name="name" placeholder="Nouvelle catégorie" class="grow"><input name="rate" placeholder="%" inputmode="decimal" style="width:70px"><button class="btn">＋</button></form></div>
 
     <div class="card"><h3>Utilisateurs</h3><p class="small muted">Le caissier peut vendre, enregistrer des dépôts et faire l’inventaire, sans voir les marges ni payer les fournisseurs.</p>
-      <div class="list">${users.map((u) => `<div class="it"><div class="grow"><div class="t">${esc(u.name)} ${u.active ? '' : '<span class="badge b-perdu">désactivé</span>'}</div><div class="s">${esc(u.username)} · ${u.role === 'admin' ? 'Administrateur' : 'Caissier'}</div></div>${u.id !== S.user.id ? `<button class="btn sm" data-upw="${u.id}">Mot de passe</button><button class="btn sm" data-uact="${u.id}" data-a="${u.active ? 0 : 1}">${u.active ? 'Désactiver' : 'Activer'}</button>` : '<span class="small muted">vous</span>'}</div>`).join('')}</div>
-      <form id="st-user" class="grid k2" style="margin-top:10px"><input name="name" placeholder="Nom" required><input name="username" placeholder="Identifiant" autocapitalize="none" required><input name="password" placeholder="Mot de passe (6+)" required><select name="role"><option value="caissier">Caissier</option><option value="admin">Administrateur</option></select><button class="btn" style="grid-column:1/-1">＋ Ajouter l’utilisateur</button></form></div>
+      <div class="list">${users.map((u) => { const canEdit = u.id !== S.user.id && (isSuper() || u.role === 'caissier'); return `<div class="it" style="flex-wrap:wrap"><div class="grow"><div class="t">${esc(u.name)} ${u.role === 'superadmin' ? '<span class="badge b-vendu">Super admin</span>' : ''} ${u.active ? '' : '<span class="badge b-perdu">désactivé</span>'}</div><div class="s">${esc(u.username)} · ${ROLE_LABEL[u.role] || u.role}</div></div>${u.id === S.user.id ? '<span class="small muted">vous</span>' : canEdit ? `<div class="btns">${isSuper() ? `<select class="btn sm" data-urole="${u.id}" style="width:auto;min-height:34px;padding:4px 8px">${Object.entries(ROLE_LABEL).map(([k, v]) => `<option value="${k}" ${u.role === k ? 'selected' : ''}>${v}</option>`).join('')}</select>` : ''}<button class="btn sm" data-upw="${u.id}">Mot de passe</button><button class="btn sm" data-uact="${u.id}" data-a="${u.active ? 0 : 1}">${u.active ? 'Désactiver' : 'Activer'}</button></div>` : '<span class="small muted">géré par le super admin</span>'}</div>`; }).join('')}</div>
+      <form id="st-user" class="grid k2" style="margin-top:10px"><input name="name" placeholder="Nom" required><input name="username" placeholder="Identifiant" autocapitalize="none" required><input name="password" placeholder="Mot de passe (6+)" required><select name="role"><option value="caissier">Caissier</option>${isSuper() ? '<option value="admin">Administrateur</option><option value="superadmin">Super admin</option>' : ''}</select><button class="btn" style="grid-column:1/-1">＋ Ajouter l’utilisateur</button></form></div>
+
+    ${isSuper() ? `<div class="card" style="border-color:#f0d0d0"><h3>Zone super admin</h3>
+      <p class="small muted">Vous seul voyez cette zone. Le <a href="#/journal">journal d’activité</a> trace les connexions, annulations, reversements, suppressions et changements de réglages.</p>
+      <p class="small"><b>Remise à zéro</b> : efface tous les articles, ventes, dépôts, fournisseurs et reversements (par exemple après les essais). Les utilisateurs, réglages et catégories sont conservés. Téléchargez une sauvegarde avant.</p>
+      <button class="btn danger" id="st-reset">Remettre les données à zéro…</button></div>` : ''}
 
     <div class="card"><h3>Exports & sauvegarde</h3><p class="small muted">Fichiers CSV ouvrables dans Excel / Numbers. Pensez à télécharger une sauvegarde complète chaque mois.</p>
       <div class="btns">${['articles', 'ventes', 'lignes', 'fournisseurs', 'reversements'].map((n) => `<a class="btn sm" href="/api/export/${n}.csv" download>⬇ ${n}</a>`).join('')}<a class="btn sm primary" href="/api/backup" download>⬇ Sauvegarde complète</a></div></div>` : ''}
@@ -1148,11 +1234,24 @@ async function viewSettings(main) {
 
     <form class="card" id="st-pw"><h3>Mon compte</h3><div class="small muted" style="margin-bottom:8px">${esc(S.user.name)} · ${esc(S.user.username)}</div>
       <div class="grid k2"><input name="current" type="password" placeholder="Mot de passe actuel" required><input name="password" type="password" placeholder="Nouveau mot de passe" required></div>
-      <div class="btns" style="margin-top:10px"><button class="btn">Changer le mot de passe</button><button type="button" class="btn danger" id="st-logout">Se déconnecter</button></div></form>`;
+      <div class="btns" style="margin-top:10px"><button class="btn">Changer le mot de passe</button><button type="button" class="btn danger" id="st-logout">Se déconnecter</button></div>
+      ${!isSuper() ? '<details style="margin-top:12px"><summary class="small muted">Activer le super admin avec un code</summary><div class="row" style="margin-top:8px"><input id="st-code" type="password" placeholder="Code SUPERADMIN_CODE" class="grow"><button type="button" class="btn" id="st-claim">Activer</button></div></details>' : ''}</form>`;
 
   $('#st-logout').onclick = async () => { await POST('/api/logout').catch(() => {}); S.user = null; location.hash = '#/'; renderAuth(); };
   $('#st-pw').onsubmit = (e) => { e.preventDefault(); busy($('button', e.target), async () => { await POST('/api/me/password', formData(e.target)); e.target.reset(); toast('Mot de passe modifié', 'ok'); }); };
+  $('#st-claim')?.addEventListener('click', (e) => busy(e.currentTarget, async () => { await POST('/api/superadmin/claim', { code: $('#st-code').value }); toast('Vous êtes maintenant super admin', 'ok'); await boot(); location.hash = '#/reglages'; }));
   if (!admin) return;
+
+  $('#st-reset')?.addEventListener('click', async () => {
+    const r = await confirmDlg('Cette action efface définitivement toutes les données de la boutique (articles, ventes, fournisseurs, dépôts, reversements). Tapez SUPPRIMER pour confirmer.', { ok: 'Tout effacer', danger: true, input: 'Tapez SUPPRIMER' });
+    if (!r) return;
+    try { await POST('/api/superadmin/reset', { confirm: r.value.trim().toUpperCase() }); store.set('cart', null); store.set('depot', null); toast('Données remises à zéro', 'ok'); location.hash = '#/'; } catch (e) { fail(e); }
+  });
+  $$('[data-urole]').forEach((sel) => (sel.onchange = async () => {
+    if (!(await confirmDlg(`Changer le rôle en « ${ROLE_LABEL[sel.value]} » ?`))) { router(); return; }
+    try { await PUT('/api/users/' + sel.dataset.urole, { role: sel.value }); toast('Rôle modifié', 'ok'); } catch (e) { fail(e); }
+    router();
+  }));
 
   const saveSettings = async (data, btn) => busy(btn, async () => { await PUT('/api/settings', data); await ensureSettings(true); S.status = await GET('/api/status'); toast('Réglages enregistrés', 'ok'); });
   $('#st-shop').onsubmit = (e) => { e.preventDefault(); saveSettings(formData(e.target), $('button.primary', e.target)).then(() => { renderShell(); router(); }); };
@@ -1185,6 +1284,22 @@ async function viewSettings(main) {
 const tierRow = (t) => `<div class="row" style="margin-bottom:8px"><input name="tmax" inputmode="decimal" placeholder="Prix max (vide = au-delà)" value="${esc(t.max ?? '')}"><input name="trate" inputmode="decimal" placeholder="%" value="${esc(t.rate ?? '')}" style="width:80px"><button type="button" class="icon-btn" data-rmrow>✕</button></div>`;
 const ruleRow = (r) => `<div class="row" style="margin-bottom:8px"><span class="small muted nowrap">Après</span><input name="rdays" inputmode="numeric" value="${esc(r.days ?? '')}" placeholder="jours"><span class="small muted nowrap">jours :</span><input name="rpct" inputmode="decimal" value="${esc(r.pct ?? '')}" placeholder="%" style="width:80px"><span class="small muted">%</span><button type="button" class="icon-btn" data-rmrow>✕</button></div>`;
 
+// ------------------------------------------------------------------ JOURNAL (super admin)
+async function viewJournal(main) {
+  if (!isSuper()) { main.innerHTML = '<div class="err">Réservé au super admin</div>'; return; }
+  const list = await GET('/api/audit');
+  main.innerHTML = `<div class="page-head"><h1>Journal d’activité</h1></div>
+    <div class="search" style="margin-bottom:10px"><input id="j-q" placeholder="Filtrer : utilisateur, action…"></div>
+    <div class="card"><div class="list" id="j-list"></div></div>`;
+  const draw = (q = '') => {
+    const f = q.toLowerCase();
+    const rows = list.filter((a) => !f || `${a.user_name} ${a.action} ${a.detail}`.toLowerCase().includes(f));
+    $('#j-list').innerHTML = rows.map((a) => `<div class="it"><div class="grow"><div class="t" style="white-space:normal">${esc(a.action)}${/ZÉRO|annul|supprim|perdu/i.test(a.action) ? ' ⚠️' : ''}</div><div class="s" style="white-space:normal">${fdate(a.created_at, true)} · ${esc(a.user_name || '—')}${a.detail ? ' · ' + esc(a.detail) : ''}</div></div></div>`).join('') || empty('Aucune activité');
+  };
+  $('#j-q').oninput = (e) => draw(e.target.value);
+  draw();
+}
+
 // ------------------------------------------------------------------ PLUS (menu mobile)
 async function viewMore(main) {
   main.innerHTML = `<h1>Menu</h1><div class="menu-grid">
@@ -1193,8 +1308,9 @@ async function viewMore(main) {
     <a href="#/depots"><span class="ic">▦</span>Bons de dépôt<div class="d">étiquettes, bons signés</div></a>
     <a href="#/inventaire"><span class="ic">✓</span>Inventaire<div class="d">comptage par scan</div></a>
     ${isAdmin() ? '<a href="#/reversements"><span class="ic">⇄</span>Reversements<div class="d">relevés fournisseurs</div></a>' : ''}
+    ${isSuper() ? '<a href="#/journal"><span class="ic">☷</span>Journal<div class="d">qui a fait quoi, quand</div></a>' : ''}
     <a href="#/reglages"><span class="ic">⚙</span>Réglages<div class="d">${isAdmin() ? 'marges, étiquettes, équipe' : 'mon compte'}</div></a>
-  </div><p class="small muted" style="margin-top:16px;text-align:center">${esc(S.user.name)} · ${isAdmin() ? 'Administrateur' : 'Caissier'}</p>`;
+  </div><p class="small muted" style="margin-top:16px;text-align:center">${esc(S.user.name)} · ${roleLabel()}</p>`;
 }
 
 // ------------------------------------------------------------------ démarrage

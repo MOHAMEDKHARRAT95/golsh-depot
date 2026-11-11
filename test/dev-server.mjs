@@ -7,6 +7,8 @@ import { makeD1, makeKV, makeAssets } from './local-env.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const env = { DB: makeD1(process.env.DB_FILE || ':memory:'), PHOTOS: makeKV(), ASSETS: makeAssets(join(root, 'public')) };
+// IA simulée pour les tests locaux (la vraie IA tourne sur Cloudflare)
+if (process.env.MOCK_AI) env.AI = { run: async () => ({ choices: [{ message: { content: '{"titre":"Veste en jean délavée","categorie":"Femme","marque":"Levi\'s","taille":"S","couleur":"Bleu","etat":"Très bon état","matiere":"coton","prix":55,"description":"Veste en jean classique"}' } }] }) };
 const port = Number(process.env.PORT || 8787);
 
 http.createServer(async (req, res) => {

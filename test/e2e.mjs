@@ -79,6 +79,25 @@ await step('impression étiquettes → PDF', async () => {
   await page.evaluate(() => document.body.classList.remove('printing'));
 });
 
+await step('dépôt avec photo + remplissage IA', async () => {
+  await page.goto(BASE + '/#/depot');
+  await page.waitForSelector('#d-sl .it');
+  await page.click('#d-sl .it');
+  await page.waitForSelector('#d-photo', { state: 'attached' });
+  await page.setInputFiles('#d-photo', '/tmp/test-photo.jpg');
+  await page.waitForSelector('text=Fiche pré-remplie');
+  const title = await page.inputValue('#d-add input[name=title]');
+  if (title !== 'Veste en jean délavée') throw new Error('titre non rempli : ' + title);
+  if ((await page.inputValue('#d-add input[name=price]')) !== '55') throw new Error('prix non rempli');
+  await shot(page, '03b-depot-photo-ia');
+  await page.click('#d-add button.gold');
+  await page.waitForSelector('.list .thumb img');
+  await page.click('#d-save');
+  await page.waitForSelector('text=Dépôt D00002');
+  await page.waitForSelector('.list .thumb img');
+  await shot(page, '03c-depot-photo-enregistre');
+});
+
 await step('caisse : vente de 2 articles', async () => {
   await page.click('nav.tabs a[data-h=caisse]');
   await page.waitForSelector('#c-code');
@@ -112,7 +131,7 @@ await step('stock + fiche article', async () => {
   await page.click('nav.tabs a[data-h=stock]');
   await page.waitForSelector('#s-list .it');
   const n = await page.$$eval('#s-list .it', (a) => a.length);
-  if (n !== 3) throw new Error('3 articles en stock attendus, trouvé ' + n);
+  if (n !== 4) throw new Error('4 articles en stock attendus, trouvé ' + n);
   await shot(page, '07-stock');
   await page.click('#s-list .it >> nth=0');
   await page.waitForSelector('text=Historique');
@@ -163,6 +182,14 @@ await step('ventes, réglages, menu, tableau de bord', async () => {
   await page.goto(BASE + '/#/');
   await page.waitForSelector('text=Ventes aujourd’hui');
   await shot(page, '15-dashboard');
+});
+
+await step('super admin : journal et zone danger', async () => {
+  await page.goto(BASE + '/#/journal');
+  await page.waitForSelector('text=Dépôt enregistré');
+  await shot(page, '15b-journal');
+  await page.goto(BASE + '/#/reglages');
+  await page.waitForSelector('#st-reset');
 });
 
 await step('scanner (ouverture sans caméra → saisie manuelle)', async () => {

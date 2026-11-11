@@ -252,3 +252,5 @@ dl.kv dd { margin: 0; font-weight: 500; word-break: break-word; }
 .grow { flex: 1; min-width: 0; }
 
 .p-brand { font-family: 'Times New Roman', serif; font-weight: 400; text-transform: uppercase; letter-spacing: .32em; font-size: 20pt; margin: 0 0 2mm; }
+.ai-filled { background: #fffbe8 !important; border-color: #e6d491 !important; }
+.ph-prev { width: 88px; height: 88px; object-fit: cover; border-radius: 12px; border: 1px solid var(--line); flex: none; }
